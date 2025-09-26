@@ -730,3 +730,261 @@ $$
 ## 连续潜变量的特殊技巧
 
 PPT最后提到，对于连续$z$和某些特定分布，存在更好但通用性稍差的替代方法。这暗示了重参数化技巧等高级方法，它们能够有效降低梯度估计的方差，为深度变分模型（如VAE）的成功训练提供了关键技术支撑。
+
+# Learning Deep Generative Models: 重参数化技巧详解
+
+## 梯度计算的核心问题
+
+我们需要计算关于$\phi$的梯度：
+$$
+E_{q(z;\phi)}[r(z)] = \int q(z;\phi)r(z)dz
+$$
+其中$z$是连续变量。直接对这个期望求梯度是困难的，因为积分的测度本身依赖于$\phi$。
+
+## 高斯分布的等价采样方式
+
+![reparameterization_trick](./Latent_Variable_Models.assets/reparameterization_trick.png)
+
+假设$q(z;\phi) = \mathcal{N}(\mu, \sigma^2 I)$是高斯分布，参数$\phi = (\mu, \sigma)$。PPT展示了两种等价的采样方式：
+- 直接采样：$z \sim q(z;\phi)$
+- 重参数化采样：$\epsilon \sim \mathcal{N}(0,I)$，$z = \mu + \sigma\epsilon = g(\epsilon;\phi)$，$g$是确定性函数！
+- 1）$\epsilon * \sigma  \sim \mathcal{N}(0, I * \sigma^2)$，这一步叫做缩放，当一个高斯分布缩放k之后，其方差会被缩放其原来的$\sigma^2$。
+- 2）$\sigma\epsilon + \mu \sim \mathcal{N}(\mu, I * \sigma^2)$ ,这一步叫做平移，平移会改变其均值，平移了多少，则对应的均值加多少。
+
+## 期望的重参数化变换
+
+利用这种等价性，可以将期望重写为两种形式：
+$$
+\begin{aligned}
+E_{z \sim q(z;\phi)}[r(z)] &= \int q(z;\phi)r(z)dz \\
+&= E_{\epsilon \sim \mathcal{N}(0,I)}[r(g(\epsilon;\phi))] \\
+&= \int \mathcal{N}(\epsilon)r(\mu + \sigma\epsilon)d\epsilon
+\end{aligned}
+$$
+
+## 梯度计算的核心优势
+
+关键优势在于梯度计算的简化：
+$$
+\begin{aligned}
+\nabla_\phi E_{q(z;\phi)}[r(z)] &= \nabla_\phi E_\epsilon[r(g(\epsilon;\phi))] \\
+&= E_\epsilon[\nabla_\phi r(g(\epsilon;\phi))]
+\end{aligned}
+$$
+现在梯度算子可以移入期望内部，因为期望的测度$\mathcal{N}(0,I)$不再依赖于$\phi$。
+
+## 蒙特卡洛估计的实现
+
+实际计算时使用蒙特卡洛估计，当$r$和$g$关于$\phi$和$\epsilon$可微且$\epsilon$易于采样时（反向传播）：
+$$
+E_\epsilon[\nabla_\phi r(g(\epsilon;\phi))] \approx \frac{1}{K} \sum_k \nabla_\phi r(g(\epsilon^k;\phi)) \text{ where } \epsilon^1, \cdots, \epsilon^K \sim \mathcal{N}(0,I)
+$$
+
+## ELBO情况下的复杂性
+
+在ELBO优化中情况稍微复杂，因为我们有$E_{q(z;\phi)}[r(z,\phi)]$而不是$E_{q(z;\phi)}[r(z)]$，期望内的项也依赖于$\phi$。具体来说，ELBO可以写成：
+$$
+\begin{aligned}
+\mathcal{L}(x;\theta,\phi) &= \sum_z q(z;\phi) \log p(z,x;\theta) + H(q(z;\phi)) \\
+&= E_{q(z;\phi)}[\underbrace{\log p(z,x;\theta) - \log q(z;\phi)}_{r(z,\phi)}]
+\end{aligned}
+$$
+
+## 重参数化在ELBO中的应用
+
+可以继续使用重参数化，假设$z = \mu + \sigma\epsilon = g(\epsilon;\phi)$如前：
+$$
+\begin{aligned}
+E_{q(z;\phi)}[r(z,\phi)] &= E_\epsilon[r(g(\epsilon;\phi),\phi)] \\
+&\approx \frac{1}{K} \sum_k r(g(\epsilon^k;\phi),\phi)
+\end{aligned}
+$$
+
+对$\phi$求梯度时，利用链式法则：
+$$
+\begin{aligned}
+\nabla_\phi E_{q(z;\phi)}[r(z,\phi)] &= \nabla_\phi E_\epsilon[r(g(\epsilon;\phi),\phi)] \\
+&= E_\epsilon[\nabla_\phi r(g(\epsilon;\phi),\phi)] \\
+&\approx \frac{1}{K} \sum_k \nabla_\phi r(g(\epsilon^k;\phi),\phi)
+\end{aligned}
+$$
+其中$\nabla_\phi r(g(\epsilon^k;\phi),\phi)$需要使用链式法则计算，因为$r$同时通过$g(\epsilon^k;\phi)$和直接依赖于$\phi$。
+
+# Amortized Inference: 摊销推断
+
+![摊销推断](./Latent_Variable_Models.assets/amortized_inference.png)
+
+## 数据集规模化的挑战
+
+之前的变分推断方法为每个数据点$x^i$使用独立的变分参数$\phi^i$，优化目标为：
+$$
+\max_\theta \ell(\theta;\mathcal{D}) \geq \max_{\theta,\phi^1,\cdots,\phi^M} \sum_{x^i \in \mathcal{D}} \mathcal{L}(x^i;\theta,\phi^i)
+$$
+PPT指出这种方法无法扩展到大数据集，因为参数数量随数据集大小线性增长。
+
+## 摊销推断的核心思想
+
+**摊销（Amortization）**：现在学习一个单一的参数化函数$f_\lambda$，将每个$x$映射到一组（好的）变分参数。这类似于在$x^i \mapsto \phi^{i,*}$上做回归。例如，如果$q(z|x^i)$是具有不同均值$\mu^1, \cdots, \mu^m$的高斯分布，我们学习一个单一神经网络$f_\lambda$将$x^i$映射到$\mu^i$。
+
+## 函数化变分分布
+
+我们用分布$q_\lambda(z|x)$来近似后验$q(z|x^i)$，其中$q_\lambda(z|x)$是由参数$\lambda$控制的函数化分布。这样，我们不再为每个样本存储独立的变分参数，而是学习一个能够根据输入$x$生成相应变分参数的函数。
+
+## 摊销推断的优势
+
+这种方法的关键优势是参数数量不再依赖于数据集大小，而只依赖于函数$f_\lambda$的复杂度。一旦训练完成，对于新的数据点，我们可以直接通过$f_\lambda$计算其变分参数，无需重新优化，实现了推断的"摊销"。这为大规模深度生成模型（如VAE）的实际应用奠定了基础。
+
+# A Variational Approximation to the Posterior: 摊销推断实例
+
+![后验变分近似实例](./Latent_Variable_Models.assets/posterior_approximation_example.png)
+
+## 具体应用场景
+
+假设$p(z,x^i;\theta)$接近真实数据分布$p_{data}(z,x^i)$，其中$z$捕获诸如数字身份（标签）、风格等信息。PPT展示了手写数字"3"、"7"和"9"的例子，说明不同数字对应不同的潜在表示。
+
+## 传统方法的局限性
+
+假设$q(z;\phi^i)$是隐变量$z$上由$\phi^i$参数化的（可处理的）概率分布。对于每个$x^i$，需要通过优化找到好的$\phi^{i,*}$（代价昂贵）。这种逐样本优化的方法在大数据集上不可行。
+
+## 摊销推断的解决方案
+
+**摊销推断**：学习如何将$x^i$映射到一组好的参数$\phi^i$，通过$q(z;f_\lambda(x^i))$实现。函数$f_\lambda$学习如何为你解决优化问题，避免了对每个样本的单独优化。
+
+## 标准记号约定
+
+在文献中，$q(z;f_\lambda(x^i))$通常记为$q_\phi(z|x)$，其中$\phi$现在表示神经网络的参数（而不是每个样本的独立参数）。这种记号统一了摊销推断的表示方式，使得$q_\phi(z|x)$成为一个以$x$为输入、输出$z$的变分分布的神经网络。
+
+# Learning with Amortized Inference: 摊销推断学习算法
+
+![摊销推断学习](./Latent_Variable_Models.assets/amortized_learning.png)
+
+## 统一的优化目标
+
+使用摊销推断后，优化目标变为：使用（随机）梯度下降优化$\sum_{x^i \in \mathcal{D}} \mathcal{L}(x^i;\theta,\phi)$作为$\theta, \phi$的函数。注意现在$\phi$是全局的神经网络参数，不再是每个样本独立的变分参数。
+
+## ELBO的摊销形式
+
+单样本ELBO现在写为：
+$$
+\begin{aligned}
+\mathcal{L}(x;\theta,\phi) &= \sum_z q_\phi(z|x) \log p(z,x;\theta) + H(q_\phi(z|x)) \\
+&= E_{q_\phi(z|x)}[\log p(z,x;\theta) - \log q_\phi(z|x)]
+\end{aligned}
+$$
+其中$q_\phi(z|x)$是由参数$\phi$控制的神经网络，将$x$映射到变分分布。
+
+## 简化的学习算法
+
+摊销推断的学习算法简化为四步：
+1. 初始化$\theta^{(0)}, \phi^{(0)}$
+2. 从$\mathcal{D}$中随机抽样数据点$x^i$
+3. 计算$\nabla_\theta \mathcal{L}(x^i;\theta,\phi)$和$\nabla_\phi \mathcal{L}(x^i;\theta,\phi)$
+4. 沿梯度方向更新$\theta, \phi$
+
+## 梯度计算方法
+
+使用前面介绍的重参数化技巧。具体地，对于ELBO：
+$$
+\mathcal{L}(x;\theta,\phi) = E_{q_\phi(z|x)}[\underbrace{\log p(z,x;\theta) - \log q_\phi(z|x)}_{r(z,\phi)}]
+$$
+
+**关于$\theta$的梯度**（相对简单）：
+$$
+\nabla_\theta \mathcal{L}(x;\theta,\phi) = E_{q_\phi(z|x)}[\nabla_\theta \log p(z,x;\theta)] \approx \frac{1}{K} \sum_k \nabla_\theta \log p(z^k,x;\theta)
+$$
+
+**关于$\phi$的梯度**（使用重参数化）：假设$q_\phi(z|x) = \mathcal{N}(\mu_\phi(x), \sigma_\phi^2(x))$，则$z = \mu_\phi(x) + \sigma_\phi(x) \cdot \epsilon = g(\epsilon; \phi, x)$，其中$\epsilon \sim \mathcal{N}(0,I)$：
+$$
+\begin{aligned}
+\nabla_\phi \mathcal{L}(x;\theta,\phi) &= \nabla_\phi E_{q_\phi(z|x)}[r(z,\phi)] \\
+&= \nabla_\phi E_\epsilon[r(g(\epsilon;\phi,x),\phi)] \\
+&= E_\epsilon[\nabla_\phi r(g(\epsilon;\phi,x),\phi)] \\
+&\approx \frac{1}{K} \sum_k \nabla_\phi r(g(\epsilon^k;\phi,x),\phi)
+\end{aligned}
+$$
+
+重参数化技巧使得我们可以通过反向传播直接计算关于神经网络参数$\phi$的梯度，这正是VAE训练的核心技术。
+
+# Autoencoder 视角与实现（Autoencoder Perspective）
+
+![auto_encoder_perspective](./Latent_Variable_Models.assets/auto_encoder_perspective.png)
+
+## ELBO的直观形式
+
+ELBO可以写成一个非常直观的形式（重建项 − KL散度）：
+
+$$
+\begin{aligned}
+\mathcal{L}(x;\theta,\phi) 
+&= E_{q_\phi(z|x)}[\log p(z,x;\theta) - \log q_\phi(z|x)] \\
+&= E_{q_\phi(z|x)}[\log p(z,x;\theta) - \log p(z) + \log p(z) - \log q_\phi(z|x)] \\
+&= \underbrace{E_{q_\phi(z|x)}[\log p(x|z;\theta)]}_{\text{regularization}} \underbrace{- D_{KL}(q_\phi(z|x)\|p(z))}_{\text{regularization}}
+\end{aligned}
+$$
+
+## 编码器-解码器架构
+
+1. **编码步骤**：输入数据点$x^i$，通过编码器网络$q_\phi(z|x^i)$采样得到$z$
+   - 编码器输出高斯分布参数：$(\mu,\sigma) = encoder_\phi(x^i)$
+   - 从这个高斯分布采样：$z \sim \mathcal{N}(\mu,\sigma^2)$
+
+2. **解码步骤**：将采样的$z$通过解码器网络$p_\theta(x|z)$重构输入
+   - 解码器输出重构分布参数：$decoder_\theta(z)$
+   - 从这个分布采样得到重构：$\hat{x} \sim p(x|z;\theta)$
+
+## VAE的通信系统类比
+
+通过一个生动的 Alice-Bob 通信场景来解释 VAE 的工作原理：
+
+![auto_encoder_perspective_2](./Latent_Variable_Models.assets/auto_encoder_perspective_2.png)
+
+1. **压缩编码阶段**（Alice的角色）：
+   - Alice需要向Bob传送图片$x^i$（如奔跑的狗）
+   - 她使用随机压缩算法：$z \sim q_\phi(z|x^i)$生成消息$\hat{z}$
+   - 这相当于VAE的编码过程，将高维图像压缩为低维潜编码
+
+2. **解码重建阶段**（Bob的角色）：
+   - Bob收到消息$\hat{z}$后，使用$p(x|\hat{z};\theta)$重建图像
+   - 这对应VAE的解码器网络，将潜编码重建为原始图像维度
+
+3. **为什么这个方案有效**：
+   - 重建项$E_{q_\phi(z|x)}[\log p(x|z;\theta)]$确保压缩后的信息能较好地重建原图
+   - KL项$D_{KL}(q_\phi(z|x)\|p(z))$强制消息分布遵循特定形式$p(z)$
+   - 一旦训练完成，Bob甚至可以通过采样$\hat{z} \sim p(z)$自主生成合理的新图像！
+
+
+## 训练目标解析
+
+ELBO由两项组成，对应自编码器的两个训练目标：
+
+1. **重建项**：$E_{q_\phi(z|x)}[\log p(x|z;\theta)]$
+   - 鼓励重构结果$\hat{x}$要接近输入$x^i$（自编码器的重建损失）
+   - 通过最大化$x^i$在给定$z$时的似然来实现
+
+2. **正则项**：$-D_{KL}(q_\phi(z|x)\|p(z))$
+   - 鼓励编码后的分布$q_\phi(z|x)$接近先验$p(z)$
+   - 防止过拟合，实现有意义的潜空间编码
+   这个类比很好地解释了VAE的双重角色：它既是一个压缩-重建系统（自编码器），又是一个生成模型（通过潜空间采样生成新数据）。
+
+- 本质分解：ELBO 可写为“重建项 − KL 正则项”，对应自编码器的重建损失与正则化：
+
+$$
+\begin{aligned}
+\mathcal{L}(x;\theta,\phi)
+&= \mathbb{E}_{q_\phi(z\mid x)}\big[\log p_\theta(z,x) - \log q_\phi(z\mid x)\big] \\
+&= \mathbb{E}_{q_\phi(z\mid x)}\big[\log p_\theta(x\mid z)\big] - D_{KL}\big(q_\phi(z\mid x)\|p(z)\big)
+\end{aligned}
+$$
+
+- 视角对应：将 $q_\phi(z\mid x)$ 看作编码器（encoder），$p_\theta(x\mid z)$ 看作解码器（decoder）。训练即在重建质量与使后验接近先验之间权衡。
+
+- 实用写法（用于实现）：最小化负ELBO 等同于最小化重建损失加 KL 项，且可用重参数化采样 $z=g(\epsilon;\phi,x)$ 获取低方差梯度：
+
+$$
+\mathcal{J}(\theta,\phi) = -\mathcal{L}(x;\theta,\phi) \approx -\frac{1}{K}\sum_{k=1}^K \log p_\theta(x\mid z^{(k)}) + D_{KL}\big(q_\phi(z\mid x)\|p(z)\big),
+$$
+
+其中 $z^{(k)}=g(\epsilon^{(k)};\phi,x),\; \epsilon^{(k)}\sim\mathcal N(0,I)$。
+
+
+
